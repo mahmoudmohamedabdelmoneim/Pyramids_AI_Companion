@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <item name="modern_ui_styled" type="id" />
+  <item name="modern_ui_observer" type="id" />
+  <item name="modern_ui_navigation_insets" type="id" />
+  <item name="modern_ui_click_highlight_bound" type="id" />
+  <item name="modern_ui_click_highlight_animator" type="id" />
+</resources>
