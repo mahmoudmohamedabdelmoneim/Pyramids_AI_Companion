@@ -269,22 +269,6 @@
             android:paddingBottom="36dp">
 
             <TextView
-                android:id="@+id/close_access_pass_trip_feedback_button"
-                android:layout_width="wrap_content"
-                android:layout_height="40dp"
-                android:background="@drawable/video_window_action"
-                android:clickable="true"
-                android:contentDescription="@string/close_trip_feedback"
-                android:focusable="true"
-                android:fontFamily="sans-serif-medium"
-                android:gravity="center"
-                android:paddingStart="16dp"
-                android:paddingEnd="16dp"
-                android:text="@string/back"
-                android:textColor="#F4D58D"
-                android:textSize="10sp" />
-
-            <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="34dp"

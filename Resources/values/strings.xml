@@ -224,7 +224,7 @@ Map data © OpenStreetMap contributors © CARTO</string>
     <string name="ticket_pdf_previous">Previous Ticket</string>
     <string name="ticket_pdf_next">Next Ticket</string>
     <string name="ticket_pdf_page">Page %1$d of %2$d</string>
-    <string name="exhibition_hall_title">Inside the exhibition hall</string>
+    <string name="exhibition_hall_title">Inside The Exhibition Hall</string>
     <string name="exhibition_hall_eyebrow">CHECK-IN COMPLETE</string>
     <string name="exhibition_hall_message">Take a tour in the hall to see the very first advanced tools ever made in ancient civilizations, built to use for every day life.\n\nSee the resemblance with our humanity and feel the true authenticity of what was created.\n\nWhen you\'re done click next.</string>
     <string name="exhibition_hall_replay">Replay Guide</string>

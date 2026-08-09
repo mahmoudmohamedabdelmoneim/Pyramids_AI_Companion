@@ -39,8 +39,6 @@ public sealed class AccessPassTripEndActivity : Activity
         _feedbackPanel = FindViewById<ScrollView>(Resource.Id.access_pass_trip_feedback_panel);
         FindViewById<TextView>(Resource.Id.access_pass_end_trip_button)!.Click += (_, _) =>
             SetFeedbackVisible(true);
-        FindViewById<TextView>(Resource.Id.close_access_pass_trip_feedback_button)!.Click += (_, _) =>
-            SetFeedbackVisible(false);
         FindViewById<TextView>(Resource.Id.submit_trip_feedback_button)!.Click += (_, _) =>
             SubmitFeedback();
 
