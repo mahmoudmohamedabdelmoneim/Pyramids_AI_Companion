@@ -4,6 +4,7 @@
     <string name="photo_two_description">Second Giza photo</string>
     <string name="next">NEXT  →</string>
     <string name="next_description">Continue to the next experience</string>
+    <string name="offline_ai_download_message">We\'re downloading AI model capabilities. You can continue on the app while we finish this.</string>
     <string name="account_screen_title">Welcome to AI Tourist Guide</string>
     <string name="create_account">Create Account</string>
     <string name="sign_in">Already have an account? Sign in</string>

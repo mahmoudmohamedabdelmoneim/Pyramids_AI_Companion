@@ -3,10 +3,15 @@ namespace AndroidApp1
     [Activity(Label = "@string/app_name", MainLauncher = true)]
     public class MainActivity : Activity
     {
+        private TextView? _modelDownloadMessage;
+
         protected override void OnCreate(Bundle? savedInstanceState)
         {
             base.OnCreate(savedInstanceState);
             SetContentView(Resource.Layout.activity_main);
+
+            _modelDownloadMessage = FindViewById<TextView>(Resource.Id.ai_model_download_message);
+            PrepareOfflineAiOnFirstLaunch();
 
             // Add giza_photo_one.jpg and giza_photo_two.jpg to Resources/drawable.
             // If they exist, they replace the designed placeholders automatically.
@@ -26,6 +31,35 @@ namespace AndroidApp1
             {
                 nextButton.Click += (_, _) =>
                     StartActivity(new Android.Content.Intent(this, typeof(AccountActivity)));
+            }
+        }
+
+        private async void PrepareOfflineAiOnFirstLaunch()
+        {
+            if (!LocalQwenRuntime.IsSupported || !QwenModelInstaller.RequiresModelCopy(this))
+            {
+                return;
+            }
+
+            if (_modelDownloadMessage is not null)
+            {
+                _modelDownloadMessage.Visibility = Android.Views.ViewStates.Visible;
+            }
+
+            var minimumMessageTime = Task.Delay(6_000);
+            try
+            {
+                // The install-time Play asset pack is already on the device. Copy its model
+                // to app-private storage on a worker thread while navigation remains usable.
+                _ = await QwenModelInstaller.TryGetModelPathAsync(this);
+                await minimumMessageTime;
+            }
+            finally
+            {
+                if (!IsDestroyed && _modelDownloadMessage is not null)
+                {
+                    _modelDownloadMessage.Visibility = Android.Views.ViewStates.Gone;
+                }
             }
         }
 

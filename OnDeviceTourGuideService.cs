@@ -210,6 +210,22 @@ internal static class QwenModelInstaller
     private static readonly object PathTaskSync = new();
     private static Task<string?>? _modelPathTask;
 
+    public static bool RequiresModelCopy(Context context)
+    {
+        try
+        {
+            var applicationContext = context.ApplicationContext ?? context;
+            var modelPath = GetModelPath(applicationContext);
+            return string.IsNullOrWhiteSpace(modelPath) ||
+                !File.Exists(modelPath) ||
+                new FileInfo(modelPath).Length != ModelFileSize;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
+
     public static Task<string?> TryGetModelPathAsync(Context context)
     {
         var applicationContext = context.ApplicationContext ?? context;
@@ -224,22 +240,30 @@ internal static class QwenModelInstaller
         string? temporaryPath = null;
         try
         {
-            var filesDirectory = context.FilesDir?.AbsolutePath;
-            if (string.IsNullOrWhiteSpace(filesDirectory))
+            var modelPath = GetModelPath(context);
+            if (string.IsNullOrWhiteSpace(modelPath))
             {
                 return null;
             }
 
-            var modelDirectory = Path.Combine(filesDirectory, "models");
-            var modelPath = Path.Combine(modelDirectory, ModelFileName);
             if (File.Exists(modelPath) && new FileInfo(modelPath).Length == ModelFileSize)
             {
                 return modelPath;
             }
 
+            var modelDirectory = Path.GetDirectoryName(modelPath);
+            if (string.IsNullOrWhiteSpace(modelDirectory))
+            {
+                return null;
+            }
+
             Directory.CreateDirectory(modelDirectory);
             temporaryPath = modelPath + ".partial";
-            using var source = context.Assets?.Open(ModelAssetName);
+            // Install-time Play Asset Delivery packs are mounted as split APKs and exposed
+            // through the package AssetManager. Recreating the package context ensures its
+            // AssetManager includes every installed split before the large model is copied
+            // to ordinary storage for the native Qwen runtime.
+            using var source = OpenPackagedModel(context);
             if (source is null)
             {
                 return null;
@@ -282,6 +306,34 @@ internal static class QwenModelInstaller
                 }
             }
         }
+    }
+
+    private static string? GetModelPath(Context context)
+    {
+        var filesDirectory = context.FilesDir?.AbsolutePath;
+        return string.IsNullOrWhiteSpace(filesDirectory)
+            ? null
+            : Path.Combine(filesDirectory, "models", ModelFileName);
+    }
+
+    private static Stream? OpenPackagedModel(Context context)
+    {
+        try
+        {
+            var packageName = context.PackageName;
+            if (!string.IsNullOrWhiteSpace(packageName))
+            {
+                var packageContext = context.CreatePackageContext(packageName, (PackageContextFlags)0);
+                return packageContext?.Assets?.Open(ModelAssetName);
+            }
+        }
+        catch (Exception)
+        {
+            // A normal APK keeps the model in the base assets. Preserve that path as a
+            // fallback without adding any Play dependency to APK builds.
+        }
+
+        return context.Assets?.Open(ModelAssetName);
     }
 }
 

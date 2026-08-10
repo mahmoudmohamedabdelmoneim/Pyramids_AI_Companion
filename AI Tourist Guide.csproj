@@ -14,7 +14,10 @@
     <EmbedAssembliesIntoApk Condition="'$(Configuration)' == 'Debug' and '$(RuntimeIdentifier)' == 'android-arm64'">true</EmbedAssembliesIntoApk>
     <!-- Keep the modernized clone installable alongside the preserved original app. -->
     <ApplicationId>com.companyname.AndroidApp1.modernized</ApplicationId>
-    <AssemblyName>AI Tourist Guide</AssemblyName>
+    <!-- Embedded Debug assemblies are packaged as native-library payloads on Android.
+         Keep the internal assembly filename free of spaces so PackageManager extracts
+         the entry assembly and the runtime can register the generated JNI callbacks. -->
+    <AssemblyName>AndroidApp1.Modernized</AssemblyName>
     <ApplicationVersion>1</ApplicationVersion>
     <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
     <!--
@@ -54,6 +57,15 @@
          repository, but package only the substantially smaller INT8 model. -->
     <AndroidAsset Remove="Assets\tts\kokoro-en-v0_19\model.onnx" />
     <AndroidAsset Remove="Assets\tts\kokoro-en-v0_19\*.bits" />
+  </ItemGroup>
+
+  <!-- Keep the 491 MB Qwen model out of the Play base module. Install-time asset packs
+       are delivered with the app and exposed through Android's AssetManager at launch.
+       Restrict this metadata to AAB builds so APK packaging remains unchanged. -->
+  <ItemGroup Condition="'$(AndroidPackageFormat)' == 'aab'">
+    <AndroidAsset Update="Assets\qwen2.5-0.5b-instruct-q4_k_m.gguf"
+                  AssetPack="qwen_model"
+                  DeliveryType="InstallTime" />
   </ItemGroup>
 
   <!-- The Qwen JNI runtime is arm64-only. Do not ship its 491 MB model to the x64 emulator
