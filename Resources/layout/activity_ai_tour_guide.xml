@@ -177,6 +177,23 @@
                 android:textColor="#09251F"
                 android:textSize="13sp" />
         </LinearLayout>
+
+        <TextView
+            android:id="@+id/report_something_wrong_button"
+            android:layout_width="match_parent"
+            android:layout_height="54dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/replay_guide_button"
+            android:clickable="true"
+            android:focusable="true"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:letterSpacing="0.04"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="@string/report_something_wrong"
+            android:textColor="#FFF2CE"
+            android:textSize="12sp" />
     </LinearLayout>
 
     <LinearLayout

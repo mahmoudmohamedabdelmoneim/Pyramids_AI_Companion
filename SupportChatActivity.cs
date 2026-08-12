@@ -15,7 +15,8 @@ public sealed class SupportChatActivity : Activity
 {
     public const string EmergencyModeExtra = "support_chat_emergency_mode";
     public const string InitialMessageExtra = "support_chat_initial_message";
-    private const int CaptureSellerProviderPhotoRequestCode = 2401;
+    private const int CaptureReportPhotoRequestCode = 2401;
+    private const int PickReportPhotoRequestCode = 2402;
 
     private readonly OnDeviceSupportService _chatService = new();
     private readonly List<TourChatMessage> _history = new();
@@ -23,13 +24,17 @@ public sealed class SupportChatActivity : Activity
     private ScrollView? _messagesScroll;
     private EditText? _messageInput;
     private TextView? _sendButton;
-    private TextView? _sellerPhotoCameraButton;
+    private TextView? _reportPhotoCameraButton;
+    private TextView? _reportPhotoGalleryButton;
+    private TextView? _skipReportPhotoButton;
     private bool _isReplyPending;
-    private bool _requestCompleted;
+    private bool _requestAcknowledged;
     private bool _isClosing;
     private bool _isEmergency;
-    private bool _sellerPhotoOfferAdded;
-    private bool _sellerPhotoCaptured;
+    private bool _reportPhotoOfferAdded;
+    private bool _reportPhotoCaptured;
+    private bool _completionPendingForPhoto;
+    private FeedbackCameraAssistance _cameraAssistance;
 
     protected override void OnCreate(Bundle? savedInstanceState)
     {
@@ -53,6 +58,7 @@ public sealed class SupportChatActivity : Activity
                 ? Resource.String.emergency_chat_welcome
                 : Resource.String.support_chat_welcome),
             isUser: false);
+        _ = _chatService.PrepareForChatAsync(this);
 
         var initialMessage = Intent?.GetStringExtra(InitialMessageExtra)?.Trim();
         if (!string.IsNullOrWhiteSpace(initialMessage))
@@ -75,7 +81,7 @@ public sealed class SupportChatActivity : Activity
 
     private void SendMessage()
     {
-        if (_isReplyPending || _requestCompleted)
+        if (_isReplyPending || _completionPendingForPhoto)
         {
             return;
         }
@@ -107,7 +113,11 @@ public sealed class SupportChatActivity : Activity
             var purpose = _isEmergency
                 ? SupportChatPurpose.Emergency
                 : SupportChatPurpose.Feedback;
-            var reply = await _chatService.RespondAsync(this, _history, purpose);
+            var reply = await _chatService.RespondAsync(
+                this,
+                _history,
+                purpose,
+                _requestAcknowledged);
             if (_isClosing)
             {
                 return;
@@ -116,17 +126,21 @@ public sealed class SupportChatActivity : Activity
             RemoveMessage(pendingMessage);
             if (reply.HasReasonableContext)
             {
-                _requestCompleted = true;
-                var completion = _isEmergency && !string.IsNullOrWhiteSpace(reply.Text)
-                    ? reply.Text
-                    : GetString(_isEmergency
-                        ? Resource.String.emergency_chat_confirmation
-                        : Resource.String.support_chat_confirmation);
-                AddMessage(
-                    GetString(Resource.String.support_chat_assistant_name),
-                    completion,
-                    isUser: false);
-                OfferSellerPhotoCaptureIfNeeded();
+                if (!string.IsNullOrWhiteSpace(reply.Text))
+                {
+                    _history.Add(new TourChatMessage(false, reply.Text));
+                    AddMessage(
+                        GetString(Resource.String.support_chat_assistant_name),
+                        reply.Text,
+                        isUser: false);
+                }
+
+                if (OfferReportPhotoCaptureIfNeeded(waitForChoice: true))
+                {
+                    return;
+                }
+
+                AcknowledgeRequest(reply.Text);
                 return;
             }
 
@@ -135,7 +149,7 @@ public sealed class SupportChatActivity : Activity
                 GetString(Resource.String.support_chat_assistant_name),
                 reply.Text,
                 isUser: false);
-            OfferSellerPhotoCaptureIfNeeded();
+            OfferReportPhotoCaptureIfNeeded(waitForChoice: false);
         }
         catch (Exception)
         {
@@ -149,14 +163,14 @@ public sealed class SupportChatActivity : Activity
                 GetString(Resource.String.support_chat_assistant_name),
                 GetString(Resource.String.support_chat_error_local),
                 isUser: false);
-            OfferSellerPhotoCaptureIfNeeded();
+            OfferReportPhotoCaptureIfNeeded(waitForChoice: false);
         }
         finally
         {
             _isReplyPending = false;
             if (!_isClosing)
             {
-                SetComposerEnabled(!_requestCompleted);
+                SetComposerEnabled(!_completionPendingForPhoto);
             }
         }
     }
@@ -164,77 +178,140 @@ public sealed class SupportChatActivity : Activity
     protected override void OnActivityResult(int requestCode, Result resultCode, Intent? data)
     {
         base.OnActivityResult(requestCode, resultCode, data);
-        if (requestCode != CaptureSellerProviderPhotoRequestCode || resultCode != Result.Ok)
+        if (resultCode != Result.Ok ||
+            requestCode is not CaptureReportPhotoRequestCode and not PickReportPhotoRequestCode)
         {
             return;
         }
 
-        var photo = data?.Extras?.Get("data") as Bitmap;
+        var fromGallery = requestCode == PickReportPhotoRequestCode;
+        var photo = fromGallery
+            ? data?.Data is { } photoUri
+                ? LoadGalleryPhoto(photoUri)
+                : null
+            : data?.Extras?.Get("data") as Bitmap;
         if (photo is null)
         {
             AddMessage(
                 GetString(Resource.String.support_chat_assistant_name),
-                GetString(Resource.String.seller_photo_capture_failed),
+                GetString(fromGallery
+                    ? Resource.String.report_photo_gallery_failed
+                    : Resource.String.seller_photo_capture_failed),
                 isUser: false);
             return;
         }
 
-        _sellerPhotoCaptured = true;
-        if (_sellerPhotoCameraButton is not null)
+        _reportPhotoCaptured = true;
+        if (_reportPhotoCameraButton is not null)
         {
-            _sellerPhotoCameraButton.Enabled = false;
-            _sellerPhotoCameraButton.SetText(Resource.String.seller_photo_captured_action);
+            _reportPhotoCameraButton.Enabled = false;
+            _reportPhotoCameraButton.SetText(Resource.String.report_photo_attached_action);
         }
 
-        _history.Add(new TourChatMessage(true, "Seller/provider photo attached to the report."));
+        if (_reportPhotoGalleryButton is not null)
+        {
+            _reportPhotoGalleryButton.Enabled = false;
+            _reportPhotoGalleryButton.SetText(Resource.String.report_photo_attached_action);
+        }
+
+        _history.Add(new TourChatMessage(
+            true,
+            _cameraAssistance switch
+            {
+                FeedbackCameraAssistance.Person =>
+                    "Person photo attached to the report as supporting evidence.",
+                FeedbackCameraAssistance.SellerOrProvider =>
+                    "Seller/provider photo attached to the report as supporting evidence.",
+                _ => "Visible-problem photo attached to the report as supporting evidence."
+            }));
         AddCapturedPhoto(photo);
+
+        if (_completionPendingForPhoto)
+        {
+            AcknowledgeRequest();
+        }
+        else if (!_isReplyPending)
+        {
+            RequestAiReplyAsync();
+        }
     }
 
-    private void OfferSellerPhotoCaptureIfNeeded()
+    private bool OfferReportPhotoCaptureIfNeeded(bool waitForChoice)
     {
-        if (_isEmergency || _sellerPhotoOfferAdded || _sellerPhotoCaptured)
+        if (_reportPhotoCaptured)
         {
-            return;
+            return false;
         }
 
-        var visitorReport = string.Join(
-            " ",
-            _history.Where(message => message.IsUser).Select(message => message.Text));
-        if (!OnDeviceSupportService.InvoiceWasNotProvided(visitorReport.ToLowerInvariant()))
+        var plan = FeedbackConversationPlanner.Analyze(_history);
+        var currentAssistance = FeedbackConversationPlanner.GetCameraAssistance(plan);
+        if (currentAssistance == FeedbackCameraAssistance.None)
         {
-            return;
+            return false;
         }
 
-        _sellerPhotoOfferAdded = true;
+        _cameraAssistance = currentAssistance;
+        if (_reportPhotoOfferAdded)
+        {
+            if (!waitForChoice ||
+                _reportPhotoCameraButton is null ||
+                _reportPhotoGalleryButton is null)
+            {
+                return false;
+            }
+
+            _completionPendingForPhoto = true;
+            AddMessage(
+                GetString(Resource.String.support_chat_assistant_name),
+                GetString(Resource.String.report_photo_final_choice),
+                isUser: false);
+            _messages?.RemoveView(_reportPhotoCameraButton);
+            _messages?.RemoveView(_reportPhotoGalleryButton);
+            AddPhotoActionButton(_reportPhotoCameraButton, widthDp: 180);
+            AddPhotoActionButton(_reportPhotoGalleryButton, widthDp: 220);
+            AddSkipPhotoButton();
+            ScrollMessagesToBottom();
+            return true;
+        }
+
+        _reportPhotoOfferAdded = true;
+        _completionPendingForPhoto = waitForChoice;
         AddMessage(
             GetString(Resource.String.support_chat_assistant_name),
-            GetString(Resource.String.seller_photo_offer),
+            GetString(_cameraAssistance switch
+            {
+                FeedbackCameraAssistance.Person => Resource.String.report_photo_person_offer,
+                FeedbackCameraAssistance.SellerOrProvider => Resource.String.report_photo_provider_offer,
+                _ => Resource.String.report_photo_issue_offer
+            }),
             isUser: false);
 
-        _sellerPhotoCameraButton = new TextView(this)
-        {
-            Text = GetString(Resource.String.open_camera),
-            TextSize = 12,
-            Gravity = GravityFlags.Center,
-            Clickable = true,
-            Focusable = true
-        };
-        _sellerPhotoCameraButton.SetTextColor(Color.ParseColor("#09251F"));
-        _sellerPhotoCameraButton.SetBackgroundResource(Resource.Drawable.next_button);
-        _sellerPhotoCameraButton.Click += (_, _) => OpenSellerProviderCamera();
+        _reportPhotoCameraButton = CreatePhotoActionButton(
+            Resource.String.open_camera,
+            Resource.Drawable.next_button,
+            "#09251F");
+        _reportPhotoCameraButton.Click += (_, _) => OpenReportCamera();
+        AddPhotoActionButton(_reportPhotoCameraButton, widthDp: 180);
 
-        var layout = new LinearLayout.LayoutParams(Dp(180), Dp(48))
+        _reportPhotoGalleryButton = CreatePhotoActionButton(
+            Resource.String.choose_from_gallery,
+            Resource.Drawable.replay_guide_button,
+            "#FFF2CE");
+        _reportPhotoGalleryButton.Click += (_, _) => OpenReportGallery();
+        AddPhotoActionButton(_reportPhotoGalleryButton, widthDp: 220);
+
+        if (waitForChoice)
         {
-            Gravity = GravityFlags.Start
-        };
-        layout.SetMargins(0, 0, 0, Dp(12));
-        _messages?.AddView(_sellerPhotoCameraButton, layout);
+            AddSkipPhotoButton();
+        }
+
         ScrollMessagesToBottom();
+        return true;
     }
 
-    private void OpenSellerProviderCamera()
+    private void OpenReportCamera()
     {
-        if (_sellerPhotoCaptured)
+        if (_reportPhotoCaptured)
         {
             return;
         }
@@ -249,14 +326,74 @@ public sealed class SupportChatActivity : Activity
             return;
         }
 
-        StartActivityForResult(cameraIntent, CaptureSellerProviderPhotoRequestCode);
+        StartActivityForResult(cameraIntent, CaptureReportPhotoRequestCode);
+    }
+
+    private void OpenReportGallery()
+    {
+        if (_reportPhotoCaptured)
+        {
+            return;
+        }
+
+        var galleryIntent = new Intent(Intent.ActionOpenDocument);
+        galleryIntent.AddCategory(Intent.CategoryOpenable);
+        galleryIntent.SetType("image/*");
+        galleryIntent.AddFlags(ActivityFlags.GrantReadUriPermission);
+        if (galleryIntent.ResolveActivity(PackageManager!) is null)
+        {
+            AddMessage(
+                GetString(Resource.String.support_chat_assistant_name),
+                GetString(Resource.String.report_photo_gallery_unavailable),
+                isUser: false);
+            return;
+        }
+
+        StartActivityForResult(galleryIntent, PickReportPhotoRequestCode);
+    }
+
+    private Bitmap? LoadGalleryPhoto(Android.Net.Uri photoUri)
+    {
+        try
+        {
+            using var boundsStream = ContentResolver?.OpenInputStream(photoUri);
+            if (boundsStream is null)
+            {
+                return null;
+            }
+
+            var bounds = new BitmapFactory.Options { InJustDecodeBounds = true };
+            _ = BitmapFactory.DecodeStream(boundsStream, null, bounds);
+            var sampleSize = 1;
+            while (bounds.OutWidth / sampleSize > 1600 || bounds.OutHeight / sampleSize > 1600)
+            {
+                sampleSize *= 2;
+            }
+
+            using var imageStream = ContentResolver?.OpenInputStream(photoUri);
+            return imageStream is null
+                ? null
+                : BitmapFactory.DecodeStream(
+                    imageStream,
+                    null,
+                    new BitmapFactory.Options { InSampleSize = sampleSize });
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private void AddCapturedPhoto(Bitmap photo)
     {
         AddMessage(
             GetString(Resource.String.chat_you),
-            GetString(Resource.String.seller_photo_attached),
+            GetString(_cameraAssistance switch
+            {
+                FeedbackCameraAssistance.Person => Resource.String.report_photo_person_attached,
+                FeedbackCameraAssistance.SellerOrProvider => Resource.String.report_photo_provider_attached,
+                _ => Resource.String.report_photo_issue_attached
+            }),
             isUser: true);
 
         var image = new ImageView(this);
@@ -272,6 +409,96 @@ public sealed class SupportChatActivity : Activity
         layout.SetMargins(0, 0, 0, Dp(12));
         _messages?.AddView(image, layout);
         ScrollMessagesToBottom();
+    }
+
+    private TextView CreatePhotoActionButton(int textResource, int backgroundResource, string textColor)
+    {
+        var button = new TextView(this)
+        {
+            Text = GetString(textResource),
+            TextSize = 12,
+            Gravity = GravityFlags.Center,
+            Clickable = true,
+            Focusable = true
+        };
+        button.SetTextColor(Color.ParseColor(textColor));
+        button.SetBackgroundResource(backgroundResource);
+        return button;
+    }
+
+    private void AddPhotoActionButton(TextView button, int widthDp)
+    {
+        var layout = new LinearLayout.LayoutParams(Dp(widthDp), Dp(48))
+        {
+            Gravity = GravityFlags.Start
+        };
+        layout.SetMargins(0, 0, 0, Dp(12));
+        _messages?.AddView(button, layout);
+    }
+
+    private void AddSkipPhotoButton()
+    {
+        if (_skipReportPhotoButton is not null)
+        {
+            _messages?.RemoveView(_skipReportPhotoButton);
+        }
+        else
+        {
+            _skipReportPhotoButton = CreatePhotoActionButton(
+                Resource.String.continue_without_photo,
+                Resource.Drawable.replay_guide_button,
+                "#FFF2CE");
+            _skipReportPhotoButton.Click += (_, _) => ContinueWithoutPhoto();
+        }
+
+        AddPhotoActionButton(_skipReportPhotoButton, widthDp: 240);
+    }
+
+    private void ContinueWithoutPhoto()
+    {
+        if (!_completionPendingForPhoto)
+        {
+            return;
+        }
+
+        AcknowledgeRequest();
+    }
+
+    private void AcknowledgeRequest(string? emergencyAcknowledgement = null)
+    {
+        if (_requestAcknowledged)
+        {
+            return;
+        }
+
+        _requestAcknowledged = true;
+        _completionPendingForPhoto = false;
+        if (_reportPhotoCameraButton is not null && !_reportPhotoCaptured)
+        {
+            _reportPhotoCameraButton.Visibility = ViewStates.Gone;
+        }
+
+        if (_reportPhotoGalleryButton is not null && !_reportPhotoCaptured)
+        {
+            _reportPhotoGalleryButton.Visibility = ViewStates.Gone;
+        }
+
+        if (_skipReportPhotoButton is not null)
+        {
+            _skipReportPhotoButton.Visibility = ViewStates.Gone;
+        }
+
+        var acknowledgement = _isEmergency && !string.IsNullOrWhiteSpace(emergencyAcknowledgement)
+            ? emergencyAcknowledgement
+            : GetString(_isEmergency
+                ? Resource.String.emergency_chat_confirmation
+                : Resource.String.support_chat_confirmation);
+        _history.Add(new TourChatMessage(false, acknowledgement));
+        AddMessage(
+            GetString(Resource.String.support_chat_assistant_name),
+            acknowledgement,
+            isUser: false);
+        SetComposerEnabled(true);
     }
 
     private void ConfigureChatMode()

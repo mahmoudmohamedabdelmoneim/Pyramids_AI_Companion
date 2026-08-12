@@ -28,9 +28,10 @@ constexpr int   N_THREADS_MIN           = 2;
 constexpr int   N_THREADS_MAX           = 4;
 constexpr int   N_THREADS_HEADROOM      = 2;
 
-// The app's combined system prompt needs more than 4K tokens. A 6K context preserves
-// the full tour knowledge while reducing KV-cache memory by 25% from the previous 8K.
-constexpr int   DEFAULT_CONTEXT_SIZE    = 6144;
+// The holistic app knowledge currently tokenizes to just over 7K tokens. Keep ample
+// room for the active conversation and generation so the model receives the complete
+// context instead of rejecting the system prompt and falling back.
+constexpr int   DEFAULT_CONTEXT_SIZE    = 12288;
 constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BATCH_SIZE              = 512;
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
@@ -416,15 +417,19 @@ Java_com_companyname_AndroidApp1_LocalQwenBridge_processSystemPrompt(
     std::string formatted_system_prompt(system_prompt);
 
     // Format system prompt if applicable
-    const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
-    if (has_chat_template) {
+    // common_chat_templates_init always supplies a usable fallback (ChatML) even when
+    // the GGUF omits explicit tokenizer.chat_template metadata. Qwen instruct models
+    // still require those role delimiters; sending raw text can make generation end
+    // immediately without a reply.
+    const bool use_chat_template = g_chat_templates != nullptr;
+    if (use_chat_template) {
         formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt);
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
     // Tokenize system prompt
     const auto system_tokens = common_tokenize(g_context, formatted_system_prompt,
-                                               has_chat_template, has_chat_template);
+                                               use_chat_template, use_chat_template);
     for (auto id: system_tokens) {
         LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
     }
@@ -469,14 +474,14 @@ Java_com_companyname_AndroidApp1_LocalQwenBridge_processUserPrompt(
     std::string formatted_user_prompt(user_prompt);
 
     // Format user prompt if applicable
-    const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
-    if (has_chat_template) {
+    const bool use_chat_template = g_chat_templates != nullptr;
+    if (use_chat_template) {
         formatted_user_prompt = chat_add_and_format(ROLE_USER, user_prompt);
     }
     env->ReleaseStringUTFChars(juser_prompt, user_prompt);
 
     // Decode formatted user prompts
-    auto user_tokens = common_tokenize(g_context, formatted_user_prompt, has_chat_template, has_chat_template);
+    auto user_tokens = common_tokenize(g_context, formatted_user_prompt, use_chat_template, use_chat_template);
     for (auto id: user_tokens) {
         LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
     }

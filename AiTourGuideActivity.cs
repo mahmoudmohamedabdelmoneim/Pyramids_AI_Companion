@@ -28,6 +28,8 @@ namespace AndroidApp1
                 _voiceService.Stop();
                 StartActivity(new Android.Content.Intent(this, typeof(TicketAccessGuideActivity)));
             };
+            FindViewById<TextView>(Resource.Id.report_something_wrong_button)!.Click += (_, _) =>
+                StartActivity(new Android.Content.Intent(this, typeof(SupportChatActivity)));
             FindViewById<TextView>(Resource.Id.replay_guide_button)!.Click += (_, _) =>
                 Narrate(GetString(Resource.String.great_gate_welcome_narration));
 

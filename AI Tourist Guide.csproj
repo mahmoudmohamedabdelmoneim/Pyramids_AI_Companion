@@ -45,6 +45,9 @@
     <AndroidJavaSource Remove="bin\**\*.java" />
     <AndroidLibrary Remove="build\**\*.jar" />
     <AndroidNativeLibrary Remove="build\**\*.so" />
+    <!-- llama.cpp's Android CPU backend links OpenMP dynamically. Keep the matching
+         NDK runtime beside the ARM64 model libraries so System.loadLibrary succeeds. -->
+    <AndroidNativeLibrary Update="native\arm64-v8a\libomp.so" />
     <AndroidLibrary Include="native\local-qwen-bridge.jar" Bind="false" Pack="true" />
     <!-- This bridge is invoked through the small hand-written JNI wrapper in C#.
          Keeping the JAR unbound avoids stale ABI-specific generated bindings. -->
@@ -63,14 +66,15 @@
        are delivered with the app and exposed through Android's AssetManager at launch.
        Restrict this metadata to AAB builds so APK packaging remains unchanged. -->
   <ItemGroup Condition="'$(AndroidPackageFormat)' == 'aab'">
-    <AndroidAsset Update="Assets\qwen2.5-0.5b-instruct-q4_k_m.gguf"
-                  AssetPack="qwen_model"
-                  DeliveryType="InstallTime" />
+    <AndroidAsset Update="Assets\qwen2.5-0.5b-instruct-q4_k_m.gguf" AssetPack="qwen_model" DeliveryType="InstallTime" />
   </ItemGroup>
 
   <!-- The Qwen JNI runtime is arm64-only. Do not ship its 491 MB model to the x64 emulator
        in Debug mode, where it cannot execute and prevents normal Visual Studio deployment. -->
   <ItemGroup Condition="'$(Configuration)' == 'Debug' and '$(RuntimeIdentifier)' == 'android-x64'">
     <AndroidAsset Remove="Assets\qwen2.5-0.5b-instruct-q4_k_m.gguf" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="artifacts\final\" />
   </ItemGroup>
 </Project>

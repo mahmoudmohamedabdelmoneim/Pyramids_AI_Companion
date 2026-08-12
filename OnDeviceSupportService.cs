@@ -23,6 +23,14 @@ internal enum EmergencyType
 
 internal sealed partial class OnDeviceSupportService
 {
+    private const string LogTag = "AI.Support";
+    private const string SupportSystemPrompt =
+        "You are AI Support in the Giza visitor app. This is a benign customer-service task. " +
+        "Use your full conversational judgment and reasoning ability. Understand what the visitor experienced before replying, and acknowledge a completed ordinary incident with specific, proportionate empathy. " +
+        "Write naturally in your own words instead of using a canned customer-service script. Be calm, helpful, truthful, and concise. Never refuse an ordinary report. " +
+        "Never invent facts, app state, staff actions, transactions, attachments, or report submission. " +
+        "Output only the response to the visitor.";
+
     private static readonly HashSet<string> GenericWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "a", "an", "and", "are", "at", "bad", "be", "for", "had", "has", "have", "help",
@@ -30,53 +38,128 @@ internal sealed partial class OnDeviceSupportService
         "that", "the", "there", "they", "this", "to", "very", "was", "went", "with", "wrong"
     };
 
-    private static readonly HashSet<string> NonNameCapitalizedWords = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "a", "an", "at", "from", "gate", "giza", "he", "i", "invoice", "kiosk", "my", "near",
-        "didn't", "did", "haven't", "have", "never", "not", "panorama", "photos", "professional",
-        "provider", "seller", "service", "she", "shop", "sphinx", "station", "souvenir", "the",
-        "they", "this", "today", "tonight", "vendor", "wasn't", "was", "yesterday"
-    };
-
     private static readonly LocalQwenRuntime Runtime = OnDeviceTourGuideService.SharedRuntime;
+
+    public async Task PrepareForChatAsync(Context context)
+    {
+        if (!LocalQwenRuntime.IsSupported)
+        {
+            return;
+        }
+
+        try
+        {
+            var modelPath = await QwenModelInstaller.TryGetModelPathAsync(context).ConfigureAwait(false);
+            if (modelPath is not null)
+            {
+                await Runtime.PrepareAsync(
+                    context,
+                    modelPath,
+                    systemPrompt: SupportSystemPrompt).ConfigureAwait(false);
+            }
+        }
+        catch (Exception)
+        {
+            // RespondAsync still has truthful deterministic fallbacks if preparation fails.
+        }
+    }
 
     public async Task<SupportChatReply> RespondAsync(
         Context context,
         IReadOnlyList<TourChatMessage> history,
-        SupportChatPurpose purpose)
+        SupportChatPurpose purpose,
+        bool requestAcknowledged = false)
     {
         var visitorReport = string.Join(" ", history.Where(message => message.IsUser).Select(message => message.Text));
+        var latestVisitorMessage = history.LastOrDefault(message => message.IsUser)?.Text ?? string.Empty;
+        if (requestAcknowledged)
+        {
+            return await ContinueConversationAsync(context, history, purpose, latestVisitorMessage);
+        }
+
+        var feedbackPlan = purpose == SupportChatPurpose.Feedback
+            ? FeedbackConversationPlanner.Analyze(history)
+            : null;
         var hasReasonableContext = purpose == SupportChatPurpose.Emergency
             ? HasReasonableEmergencyContext(visitorReport)
-            : HasReasonableReportContext(visitorReport);
-        if (hasReasonableContext)
+            : feedbackPlan!.IsComplete;
+        if (hasReasonableContext && purpose == SupportChatPurpose.Emergency)
         {
-            var completion = purpose == SupportChatPurpose.Emergency
-                ? BuildEmergencyCompletion(visitorReport)
-                : string.Empty;
+            var completion = BuildEmergencyCompletion(visitorReport);
             return new SupportChatReply(completion, HasReasonableContext: true);
         }
 
-        var fallbackQuestion = BuildFallbackQuestion(visitorReport, purpose);
+        if (feedbackPlan is { IsGateScam: true, IsComplete: true })
+        {
+            return new SupportChatReply(
+                FeedbackConversationPlanner.BuildCompletionResponse(feedbackPlan),
+                HasReasonableContext: true);
+        }
+
+        var fallbackQuestion = purpose == SupportChatPurpose.Emergency
+            ? BuildEmergencyFallbackResponse(visitorReport, Words().Matches(visitorReport).Count)
+            : feedbackPlan!.IsComplete
+                ? FeedbackConversationPlanner.BuildCompletionResponse(feedbackPlan)
+                : BuildFeedbackFallbackResponse(feedbackPlan);
         var modelPath = await QwenModelInstaller.TryGetModelPathAsync(context);
         if (modelPath is null)
         {
-            return new SupportChatReply(fallbackQuestion, HasReasonableContext: false);
+            Android.Util.Log.Warn(LogTag, "Qwen model unavailable; using the support fallback.");
+            return new SupportChatReply(fallbackQuestion, HasReasonableContext: hasReasonableContext);
         }
 
         var prompt = BuildSupportPrompt(history, purpose);
-        var modelReply = await Runtime.TryCompleteAsync(context, modelPath, prompt);
-        var followUp = NormalizeFollowUp(modelReply);
+        var modelReply = await Runtime.TryCompleteAsync(
+            context,
+            modelPath,
+            prompt,
+            systemPrompt: SupportSystemPrompt);
+        var followUp = purpose == SupportChatPurpose.Feedback
+            ? NormalizeFeedbackReply(modelReply)
+            : NormalizeFollowUp(modelReply);
+        if (purpose == SupportChatPurpose.Feedback &&
+            feedbackPlan is { IsGateScam: true, IsComplete: true } &&
+            !CoversCompleteGateIncident(followUp))
+        {
+            Android.Util.Log.Info(
+                LogTag,
+                "Qwen's first gate-incident reply lacked semantic coverage; asking the model to revise it.");
+            var revisedReply = await Runtime.TryCompleteAsync(
+                context,
+                modelPath,
+                BuildGateIncidentRevisionPrompt(history),
+                systemPrompt: SupportSystemPrompt);
+            followUp = NormalizeFeedbackReply(revisedReply);
+        }
+        if (purpose == SupportChatPurpose.Feedback)
+        {
+            Android.Util.Log.Info(
+                LogTag,
+                followUp is not null &&
+                (feedbackPlan is not { IsGateScam: true, IsComplete: true } || CoversCompleteGateIncident(followUp))
+                    ? "Accepted Qwen support reply."
+                    : string.IsNullOrWhiteSpace(modelReply)
+                        ? "Qwen returned no support reply; using the fallback."
+                        : "Qwen support reply failed a truthfulness or semantic-coverage guard; using the fallback.");
+        }
         if (followUp is not null && purpose == SupportChatPurpose.Emergency &&
             !CoversEmergencyResponseRequirements(followUp, visitorReport))
         {
             followUp = null;
         }
 
-        if (followUp is not null && purpose == SupportChatPurpose.Feedback &&
-            !CoversMissingReportDetails(followUp, visitorReport))
+        if (followUp is not null && purpose == SupportChatPurpose.Feedback)
         {
-            followUp = null;
+            if (feedbackPlan is { IsGateScam: true, IsComplete: true } &&
+                !CoversCompleteGateIncident(followUp))
+            {
+                followUp = null;
+            }
+        }
+
+        if (followUp is not null && purpose == SupportChatPurpose.Feedback)
+        {
+            followUp = AppTourKnowledge.ApplyCriticalPolicyGuard(latestVisitorMessage, followUp);
         }
 
         if (followUp is not null && purpose == SupportChatPurpose.Emergency)
@@ -86,32 +169,77 @@ internal sealed partial class OnDeviceSupportService
 
         return new SupportChatReply(
             followUp ?? fallbackQuestion,
-            HasReasonableContext: false);
+            HasReasonableContext: hasReasonableContext);
+    }
+
+    private static async Task<SupportChatReply> ContinueConversationAsync(
+        Context context,
+        IReadOnlyList<TourChatMessage> history,
+        SupportChatPurpose purpose,
+        string latestVisitorMessage)
+    {
+        var fallback = purpose == SupportChatPurpose.Emergency
+            ? "I'm still here. Keep sharing any changes or details, and alert nearby staff immediately if you can."
+            : BuildFeedbackFallbackResponse(FeedbackConversationPlanner.Analyze(history));
+        if (string.IsNullOrWhiteSpace(fallback))
+        {
+            fallback = "Thank you for the additional detail. You can keep sharing information or ask another question.";
+        }
+        var modelPath = await QwenModelInstaller.TryGetModelPathAsync(context);
+        if (modelPath is null)
+        {
+            return new SupportChatReply(fallback, HasReasonableContext: false);
+        }
+
+        var conversation = string.Join(
+            "\n",
+            history.TakeLast(10).Select(message =>
+                $"{(message.IsUser ? "Visitor" : "Support")}: {message.Text}"));
+        var task = purpose == SupportChatPurpose.Emergency
+            ? "Continue an active emergency-support conversation after the help request was acknowledged. " +
+              "Respond naturally to the visitor's latest message, acknowledge important changes, and ask at most one useful safety follow-up question. " +
+              "Do not diagnose, recommend medication, invent staff actions, or repeat that help was dispatched. "
+            : "You are AI Support inside the Something Wrong? Report to Us screen. Continue the active support conversation after the report was acknowledged. " +
+              "The visitor is already using the report option, so never tell them to open, choose, or use it. " +
+              "Use your full conversational judgment: respond to the latest meaning, acknowledge useful new details, answer relevant questions, and ask at most one genuinely useful follow-up. " +
+              "Do not invent actions by staff or claim that a new report was submitted. ";
+        var prompt = task +
+            "The visitor controls when to leave, so never end, close, conclude, or sign off from the conversation, and never say that no more messages can be sent. " +
+            "Output only the response in no more than three short sentences.\n" +
+            conversation;
+        var modelReply = await Runtime.TryCompleteAsync(
+            context,
+            modelPath,
+            prompt,
+            systemPrompt: SupportSystemPrompt);
+        var reply = purpose == SupportChatPurpose.Feedback
+            ? NormalizeFeedbackReply(modelReply, allowAcknowledgedReport: true)
+            : NormalizeOngoingReply(modelReply);
+        if (reply is not null && purpose == SupportChatPurpose.Feedback)
+        {
+            reply = AppTourKnowledge.ApplyCriticalPolicyGuard(latestVisitorMessage, reply);
+        }
+
+        return new SupportChatReply(reply ?? fallback, HasReasonableContext: false);
+    }
+
+    private static string BuildFeedbackFallbackResponse(FeedbackConversationPlan plan)
+    {
+        if (FeedbackConversationPlanner.IsReportScreenClarification(plan.LatestVisitorMessage))
+        {
+            return "Yes, you are already in Something Wrong? Report to Us. If you are reporting a real incident, tell me what happened and I will collect the useful details here.";
+        }
+
+        if (VerifiedGateIncidentScenario.AsksAboutPersonCollectingPayment(plan.LatestVisitorMessage))
+        {
+            return $"No. {VerifiedGateIncidentScenario.AppOnlyPaymentStatement} Do not pay the person or return to them.";
+        }
+
+        return FeedbackConversationPlanner.BuildFallbackResponse(plan);
     }
 
     internal static bool HasReasonableReportContext(string report)
-    {
-        var words = Words().Matches(report).Select(match => match.Value).ToArray();
-        if (report.Trim().Length < 20 || words.Length < 5)
-        {
-            return false;
-        }
-
-        var meaningfulWordCount = words.Count(word => word.Length > 1 && !GenericWords.Contains(word));
-        if (meaningfulWordCount < 3 || !HasReportLocation(report))
-        {
-            return false;
-        }
-
-        var normalized = report.ToLowerInvariant();
-        if (InvoiceWasNotProvided(normalized) &&
-            !HasSellerProviderIdNumber(report) && !HasSellerProviderName(report))
-        {
-            return false;
-        }
-
-        return !LikelyInvolvesAnotherPerson(normalized) || HasInvolvedPersonDetail(normalized);
-    }
+        => FeedbackConversationPlanner.Analyze([new TourChatMessage(true, report)]).IsComplete;
 
     internal static bool HasReasonableEmergencyContext(string report)
     {
@@ -142,54 +270,74 @@ internal sealed partial class OnDeviceSupportService
         var visitorReport = string.Join(
             " ",
             history.Where(message => message.IsUser).Select(message => message.Text));
+        var feedbackPlan = purpose == SupportChatPurpose.Feedback
+            ? FeedbackConversationPlanner.Analyze(history)
+            : null;
+        if (feedbackPlan is { IsGateScam: true, IsComplete: true })
+        {
+            return "AI SUPPORT: COMPLETE INCIDENT RESPONSE\n" +
+                $"Complete recent conversation:\n{conversation}\n\n" +
+                "Semantic context supplied by the app: this is a complete ordinary incident report. Understand and acknowledge the specific conduct in the visitor's own words, including redirection only if the visitor actually mentioned it. " +
+                "The app already has the Great Gate location and the phone's current local timestamp " +
+                $"({DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}), so no detail is missing. The person asking for the additional payment is not a gate officer. " +
+                "Entry through the official Great Gate remains available, and gate officers are present there. All payments are handled inside the app. " +
+                "The Great Gate and every later official station are safe; this is calm guidance about the person's outside conduct, not a danger warning.\n\n" +
+                "Write two or three short sentences directly to the visitor. First respond to what they experienced with warm, proportionate empathy. Then naturally reassure them about Great Gate entry and officers, explain the in-app payment rule, and advise them not to pay the person or return to them. " +
+                "Use your own wording and conversational judgment rather than copying an acknowledgment template. Ask no question. Do not mention a seller, provider, invoice, ticket, camera, legitimacy, report submission, review, or staff action. Output only the visitor-facing reply.";
+        }
+
         var task = purpose == SupportChatPurpose.Emergency
             ? BuildEmergencyPromptTask(visitorReport)
-            : BuildFeedbackPromptTask(visitorReport);
+            : FeedbackConversationPlanner.BuildPromptInstruction();
 
         var outputInstruction = purpose == SupportChatPurpose.Emergency
             ? " Output only the emergency response.\n"
-            : " Output only the follow-up question.\n";
+            : " Output only your natural reply to the visitor.\n";
         return task + outputInstruction + conversation;
     }
 
-    private static string BuildFallbackQuestion(string report, SupportChatPurpose purpose)
+    private static string BuildGateIncidentRevisionPrompt(IReadOnlyList<TourChatMessage> history)
     {
-        var wordCount = Words().Matches(report).Count;
-        if (purpose == SupportChatPurpose.Emergency)
+        var visitorWords = string.Join(
+            " ",
+            history.Where(message => message.IsUser).Select(message => message.Text.Trim()));
+        return "Revise your previous reply from scratch because it was generic, asked for information already known, or omitted useful guidance. " +
+            $"The visitor said: {visitorWords} " +
+            "Address the visitor as you. In two or three short, natural sentences: empathize specifically with being put in the position the visitor described; reassure them that official Great Gate entry remains available and officers are present there; and explain that payments are handled inside the app, so they should not pay the person or return to them. " +
+            "Do not ask a question or claim that anything was submitted, reviewed, or acted on. Do not mention a seller, provider, invoice, ticket, camera, or legitimacy. Preserve these meanings but choose the wording yourself. Output only the revised reply.";
+    }
+
+    private static bool CoversCompleteGateIncident(string? reply)
+    {
+        if (string.IsNullOrWhiteSpace(reply))
         {
-            return BuildEmergencyFallbackResponse(report, wordCount);
+            return false;
         }
 
-        var normalizedReport = report.ToLowerInvariant();
-        if (InvoiceWasNotProvided(normalizedReport))
-        {
-            return BuildInvoiceFallbackQuestion(report);
-        }
+        var normalized = reply.ToLowerInvariant();
+        var hasSpecificEmpathy = ContainsAny(
+            normalized,
+            "i'm sorry", "i am sorry", "sorry you", "understand how", "understand that", "uncomfortable",
+            "frustrating", "frustrated", "unwelcome", "upsetting", "shouldn't have been", "should not have been");
+        var reassuresEntry = ContainsAny(normalized, "great gate", "official gate") &&
+            ContainsAny(normalized, "entry", "enter", "access") &&
+            ContainsAny(normalized, "available", "open", "remains") &&
+            normalized.Contains("officer", StringComparison.Ordinal);
+        var givesPaymentRule = normalized.Contains("app", StringComparison.Ordinal) &&
+            ContainsAny(normalized, "payment", "payments", "pay");
+        var saysDoNotPay = ContainsAny(
+            normalized,
+            "do not pay", "don't pay", "should not pay", "shouldn't pay", "avoid paying", "must not pay");
+        var saysDoNotReturn = ContainsAny(
+            normalized,
+            "do not return", "don't return", "should not return", "shouldn't return", "not go back", "don't go back", "do not go back");
+        var containsWrongContext = normalized.Contains('?') || ContainsAny(
+            normalized,
+            "seller", "provider", "invoice", "show your ticket", "verified ticket", "camera", "photograph",
+            "legitimate", "report was sent", "report has been sent", "report was submitted",
+            "report has been submitted", "staff were notified", "staff have been notified");
 
-        var isPersonalIncident = LikelyInvolvesAnotherPerson(normalizedReport);
-        var needsLocation = !HasReportLocation(report);
-        var needsInvolvedPerson = isPersonalIncident && !HasInvolvedPersonDetail(normalizedReport);
-
-        if (needsLocation && needsInvolvedPerson)
-        {
-            return "Where was the person you're reporting when this happened, and do you know who did this or who else was involved?";
-        }
-
-        if (needsLocation)
-        {
-            return isPersonalIncident
-                ? "Where was the person you're reporting when this happened?"
-                : wordCount < 4
-                    ? "Could you tell me what happened and where it happened?"
-                    : "Where did this happen, such as the nearest station, landmark, or service area?";
-        }
-
-        if (needsInvolvedPerson)
-        {
-            return "Do you know who did this or who else was involved, such as their name, role, or description?";
-        }
-
-        return "Could you share one more specific detail about what happened?";
+        return hasSpecificEmpathy && reassuresEntry && givesPaymentRule && saysDoNotPay && saysDoNotReturn && !containsWrongContext;
     }
 
     private static string BuildEmergencyPromptTask(string visitorReport)
@@ -322,71 +470,6 @@ internal sealed partial class OnDeviceSupportService
             : $"Is {affectedPerson} conscious and breathing?";
     }
 
-    private static string BuildFeedbackPromptTask(string visitorReport)
-    {
-        var normalizedReport = visitorReport.ToLowerInvariant();
-        if (InvoiceWasNotProvided(normalizedReport))
-        {
-            return "Visitor support form task. The seller or provider did not issue an invoice. " +
-                BuildInvoicePromptInstruction(visitorReport) +
-                "Ask one short, empathetic follow-up question. Do not claim the report was sent.";
-        }
-
-        var isPersonalIncident = LikelyInvolvesAnotherPerson(normalizedReport);
-        var needsLocation = !HasReportLocation(visitorReport);
-        var needsInvolvedPerson = isPersonalIncident && !HasInvolvedPersonDetail(normalizedReport);
-
-        var requiredQuestion = needsLocation && needsInvolvedPerson
-            ? "Ask where the person being reported was when this happened and also ask who did it or who else was involved, such as their name, role, or description if known. "
-            : needsLocation
-                ? isPersonalIncident
-                    ? "Ask where the person being reported was when this happened. "
-                    : "Ask where the incident happened, using a station, landmark, or service area. "
-                : needsInvolvedPerson
-                    ? "Ask who did this or who else was involved, such as their name, role, or description if known. "
-                    : "Ask for the most important missing detail about what happened. ";
-
-        return "Visitor support form task. The report does not have enough detail yet. " +
-            requiredQuestion +
-            "Ask one short, empathetic follow-up question. Do not answer a sightseeing question and do not claim the report was sent.";
-    }
-
-    private static bool CoversMissingReportDetails(string followUp, string report)
-    {
-        var normalizedFollowUp = followUp.ToLowerInvariant();
-        var normalizedReport = report.ToLowerInvariant();
-        var asksForLocation = ContainsAny(
-            normalizedFollowUp,
-            "where", "location", "landmark", "station", "area", "place", "site", "spot");
-        var asksWhoWasInvolved = ContainsAny(
-            normalizedFollowUp,
-            "who", "name", "role", "description", "describe", "identify", "which person");
-        var paddedFollowUp = $" {normalizedFollowUp} ";
-        var asksForIdNumber = ContainsAny(
-            paddedFollowUp,
-            " id ", "id number", "identification number", "badge number", "employee number");
-
-        if (InvoiceWasNotProvided(normalizedReport))
-        {
-            if (!HasSellerProviderIdNumber(report) && !HasSellerProviderName(report) &&
-                !asksForIdNumber && !asksWhoWasInvolved)
-            {
-                return false;
-            }
-
-            return HasReportLocation(report) || asksForLocation;
-        }
-
-        if (!HasReportLocation(report) && !asksForLocation)
-        {
-            return false;
-        }
-
-        return !LikelyInvolvesAnotherPerson(normalizedReport) ||
-            HasInvolvedPersonDetail(normalizedReport) ||
-            asksWhoWasInvolved;
-    }
-
     private static bool CoversEmergencyResponseRequirements(string followUp, string report)
     {
         var normalizedFollowUp = followUp.ToLowerInvariant();
@@ -444,108 +527,8 @@ internal sealed partial class OnDeviceSupportService
         return ReportLocation().IsMatch(report);
     }
 
-    internal static bool InvoiceWasNotProvided(string normalizedReport) =>
-        normalizedReport.Contains("invoice", StringComparison.Ordinal) &&
-        ContainsAny(
-            normalizedReport,
-            "didn't provide", "did not provide", "not provide", "didn't give", "did not give",
-            "not give", "no invoice", "without an invoice", "never received", "didn't receive",
-            "did not receive", "haven't received", "have not received", "wasn't given",
-            "was not given", "refused", "wouldn't give", "would not give", "won't give",
-            "will not give", "didn't issue", "did not issue", "failed to issue", "not issued",
-            "invoice wasn't provided", "invoice was not provided", "invoice wasn't given",
-            "invoice was not given", "missing invoice");
-
-    private static string BuildInvoiceFallbackQuestion(string report)
-    {
-        var needsIdOrName = !HasSellerProviderIdNumber(report) && !HasSellerProviderName(report);
-        var needsPlace = !HasReportLocation(report);
-
-        return (needsIdOrName, needsPlace) switch
-        {
-            (true, true) => "What is the seller/provider's ID number or name, and where are they located?",
-            (true, false) => "What is the seller/provider's ID number or name?",
-            (false, true) => "Where was the seller/provider located?",
-            _ => "Could you share one more detail about the missing invoice?"
-        };
-    }
-
-    private static string BuildInvoicePromptInstruction(string report)
-    {
-        var needsIdOrName = !HasSellerProviderIdNumber(report) && !HasSellerProviderName(report);
-        var needsPlace = !HasReportLocation(report);
-        if (needsIdOrName && needsPlace)
-        {
-            return "Ask exactly: \"What is the seller/provider's ID number or name, and where are they located?\" ";
-        }
-
-        var missingDetails = new List<string>();
-        if (needsIdOrName)
-        {
-            missingDetails.Add("either the seller/provider's ID number or their name");
-        }
-
-        if (needsPlace)
-        {
-            missingDetails.Add("where they were located");
-        }
-
-        return missingDetails.Count > 0
-            ? $"Ask for {string.Join(", and ", missingDetails)}. "
-            : "Ask for one important missing detail without asking for their ID number, name, or location again. ";
-    }
-
-    private static bool HasSellerProviderIdNumber(string report)
-    {
-        var normalized = report.ToLowerInvariant();
-        var padded = $" {normalized} ";
-        return ContainsAny(
-                padded,
-                " id ", "id number", "identification number", "badge number", "employee id",
-                "employee number", "staff number", "seller number", "provider number") ||
-            ContainsAny(
-                normalized,
-                "don't know the id", "do not know the id", "didn't see an id", "did not see an id",
-                "id is unknown", "id was unknown", "no visible id", "no id visible") ||
-            SellerProviderIdNumber().IsMatch(report);
-    }
-
-    private static bool HasSellerProviderName(string report)
-    {
-        var normalized = report.ToLowerInvariant();
-        if (ContainsAny(
-                normalized,
-                "seller's name", "seller name", "provider's name", "provider name", "vendor's name",
-                "vendor name", "named ", "called ",
-                "don't know the name", "do not know the name", "didn't know the name",
-                "did not know the name", "not sure of the name", "name is unknown"))
-        {
-            return true;
-        }
-
-        return CapitalizedWord()
-            .Matches(report)
-            .Select(match => match.Value)
-            .Any(word => !NonNameCapitalizedWords.Contains(word));
-    }
-
-    private static bool LikelyInvolvesAnotherPerson(string normalizedReport) =>
-        ContainsAny(
-            normalizedReport,
-            "harass", "assault", "attack", "threat", "push", "hit ", "punched", "kick", "touch",
-            "follow", "stalk", "rob", "stole", "steal", "scam", "fraud", "overcharg", "charged me",
-            "rude", "insult", "shout", "yell", "fight", "refus", "demand", "pressure", "forced",
-            "did this", "someone", "somebody", "a person", "this person", "he ", "she ", "they ");
-
-    private static bool HasInvolvedPersonDetail(string normalizedReport) =>
-        ContainsAny(
-            normalizedReport,
-            "seller", "provider", "vendor", "staff", "employee", "guide", "driver", "saddle-man",
-            "saddle man", "caret", "photographer", "guard", "officer", "cashier", "attendant", "agent",
-            "tourist", "visitor", "man ", "woman", "boy", "girl", "child", "group", "named ",
-            "name is", "name was", "wearing", "uniform", "badge", "don't know", "do not know",
-            "didn't know", "did not know", "couldn't identify", "could not identify", "not sure who",
-            "unknown person", "didn't see", "did not see", "cannot remember", "can't remember");
+    internal static bool InvoiceWasNotProvided(string report) =>
+        FeedbackConversationPlanner.InvoiceWasNotProvided(report);
 
     private static string? NormalizeFollowUp(string? modelReply)
     {
@@ -560,6 +543,57 @@ internal sealed partial class OnDeviceSupportService
             reply.Contains("submitted", StringComparison.OrdinalIgnoreCase) ||
             reply.Contains("notified", StringComparison.OrdinalIgnoreCase) ||
             reply.Contains("at this stop", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return reply;
+    }
+
+    private static string? NormalizeFeedbackReply(
+        string? modelReply,
+        bool allowAcknowledgedReport = false)
+    {
+        if (string.IsNullOrWhiteSpace(modelReply))
+        {
+            return null;
+        }
+
+        var reply = modelReply.Trim();
+        var normalized = reply.ToLowerInvariant();
+        var falselyClaimsSubmission = !allowAcknowledgedReport && ContainsAny(
+            normalized,
+            "report was sent", "report has been sent", "report was submitted",
+            "report has been submitted", "feedback was sent", "feedback has been sent",
+            "staff were notified", "staff have been notified");
+        var redirectsToCurrentScreen = ContainsAny(
+            normalized,
+            "use something wrong", "open something wrong", "choose something wrong",
+            "select something wrong", "tap something wrong", "go to something wrong",
+            "navigate to something wrong");
+        if (reply.Length < 2 || falselyClaimsSubmission || redirectsToCurrentScreen)
+        {
+            return null;
+        }
+
+        return reply;
+    }
+
+    private static string? NormalizeOngoingReply(string? modelReply)
+    {
+        if (string.IsNullOrWhiteSpace(modelReply))
+        {
+            return null;
+        }
+
+        var reply = modelReply.Trim();
+        var normalized = reply.ToLowerInvariant();
+        if (reply.Length < 2 || reply.Length > 600 || ContainsAny(
+                normalized,
+                "chat is closed", "chat is now closed", "chat has ended", "conversation has ended",
+                "conversation is over", "conversation is now over", "this concludes", "goodbye",
+                "no more messages", "cannot continue this chat", "can't continue this chat",
+                "you may close the chat", "you can close the chat"))
         {
             return null;
         }
@@ -647,9 +681,4 @@ internal sealed partial class OnDeviceSupportService
         RegexOptions.IgnoreCase)]
     private static partial Regex ReportLocation();
 
-    [GeneratedRegex(@"\b\p{Lu}[\p{L}'-]{2,}\b")]
-    private static partial Regex CapitalizedWord();
-
-    [GeneratedRegex(@"\b(?:[A-Z]{1,3}-?)?\d{3,}\b", RegexOptions.IgnoreCase)]
-    private static partial Regex SellerProviderIdNumber();
 }

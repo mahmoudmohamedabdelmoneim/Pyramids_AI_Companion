@@ -82,6 +82,9 @@ internal sealed class OnDeviceTourGuideService
             return CompleteReply(supportReply);
         }
 
+        // Keep direct app/navigation answers immediate and deterministic. This was the
+        // original ASK ME behavior and avoids spending a model turn on greetings, screen
+        // navigation, and other facts the app already knows exactly.
         var preciseNextAction = AppTourKnowledge.TryAnswerPreciseNextAction(question, _stop);
         if (preciseNextAction is not null)
         {
@@ -103,9 +106,9 @@ internal sealed class OnDeviceTourGuideService
                 var qwenReply = await SharedRuntime
                     .TryCompleteAsync(context, modelPath, question, _stop)
                     .ConfigureAwait(false);
-                if (!string.IsNullOrWhiteSpace(qwenReply))
+                if (IsUsefulModelReply(qwenReply, question))
                 {
-                    return CompleteReply(qwenReply);
+                    return CompleteReply(AppTourKnowledge.ApplyCriticalPolicyGuard(question, qwenReply!));
                 }
             }
         }
@@ -115,17 +118,44 @@ internal sealed class OnDeviceTourGuideService
         return CompleteReply(AppTourKnowledge.Answer(question, knowledgeStop));
     }
 
+    private static bool IsUsefulModelReply(string? reply, string question)
+    {
+        if (string.IsNullOrWhiteSpace(reply))
+        {
+            return false;
+        }
+
+        static string NormalizeForComparison(string value) =>
+            new(value
+                .Where(char.IsLetterOrDigit)
+                .Select(char.ToLowerInvariant)
+                .ToArray());
+
+        return !string.Equals(
+            NormalizeForComparison(reply),
+            NormalizeForComparison(question),
+            StringComparison.Ordinal);
+    }
+
     private static string CompleteReply(string reply)
         => reply;
 }
 
 internal static class AppAssistantSupportRouter
 {
-    public static bool TryOpen(Context context, string message, out string reply)
+    public static bool TryOpen(
+        Context context,
+        string message,
+        out string reply)
     {
         var normalized = message.Trim().ToLowerInvariant();
+        var isVerifiedGateIncident = VerifiedGateIncidentScenario.IsMatch(message);
+        var requestsCamera = VerifiedGateIncidentScenario.RequestsCamera(message);
+        var lacksReportInformation = VerifiedGateIncidentScenario.ExplicitlyLacksReportInformation(message);
+        var opensCameraReport = requestsCamera || lacksReportInformation;
         var isEmergency = IsEmergencyRequest(normalized);
-        var isReport = !isEmergency && IsReportRequest(normalized);
+        var isReport = !isEmergency &&
+            (isVerifiedGateIncident || opensCameraReport || IsReportRequest(normalized));
         if (!isEmergency && !isReport)
         {
             reply = string.Empty;
@@ -141,9 +171,18 @@ internal static class AppAssistantSupportRouter
         }
 
         context.StartActivity(intent);
-        reply = context.GetString(isEmergency
-            ? Resource.String.ask_me_opening_emergency_support
-            : Resource.String.ask_me_opening_report_support);
+        reply = context.GetString(
+            isVerifiedGateIncident
+                ? isEmergency
+                    ? Resource.String.ask_me_opening_gate_emergency_support
+                    : Resource.String.ask_me_opening_gate_report_support
+                : opensCameraReport
+                    ? isEmergency
+                        ? Resource.String.ask_me_opening_photo_emergency_support
+                        : Resource.String.ask_me_opening_photo_report_support
+                : isEmergency
+                    ? Resource.String.ask_me_opening_emergency_support
+                    : Resource.String.ask_me_opening_report_support);
         return true;
     }
 
@@ -175,6 +214,11 @@ internal static class AppAssistantSupportRouter
 
     private static bool IsReportRequest(string text)
     {
+        if (VerifiedGateIncidentScenario.IsSuspiciousReport(text))
+        {
+            return true;
+        }
+
         if (ContainsAny(
                 text,
                 "something wrong",
@@ -339,7 +383,9 @@ internal static class QwenModelInstaller
 
 internal sealed class LocalQwenRuntime
 {
-    private const int PredictionTokenLimit = 280;
+    private const string LogTag = "AI.Qwen";
+    private const int PredictionTokenLimit = 384;
+    private static readonly TimeSpan CompletionGateWait = TimeSpan.FromMilliseconds(500);
 
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private readonly Dictionary<string, Java.Lang.Reflect.Method> _methods = new(StringComparer.Ordinal);
@@ -348,7 +394,8 @@ internal sealed class LocalQwenRuntime
     private bool _nativeModelLoaded;
     private bool _modelPrepared;
     private string? _loadedModelPath;
-    private bool _holisticPromptPrepared;
+    private bool _systemPromptPrepared;
+    private string? _preparedSystemPrompt;
     private int _preparationVersion;
 
     public static bool IsSupported =>
@@ -357,8 +404,10 @@ internal sealed class LocalQwenRuntime
     public async Task<bool> PrepareAsync(
         Context context,
         string modelPath,
-        TourGuideStop stop = TourGuideStop.GreatGate)
+        TourGuideStop stop = TourGuideStop.GreatGate,
+        string? systemPrompt = null)
     {
+        var desiredSystemPrompt = systemPrompt ?? AppTourKnowledge.BuildHolisticSystemPrompt();
         var preparationVersion = Interlocked.Increment(ref _preparationVersion);
         await _operationGate.WaitAsync().ConfigureAwait(false);
         try
@@ -368,7 +417,23 @@ internal sealed class LocalQwenRuntime
                 return true;
             }
 
-            return await Task.Run(() => EnsurePrepared(context, modelPath, stop)).ConfigureAwait(false);
+            return await Task.Run(() =>
+            {
+                var canResetExistingConversation =
+                    _modelPrepared &&
+                    _systemPromptPrepared &&
+                    string.Equals(_loadedModelPath, modelPath, StringComparison.Ordinal) &&
+                    string.Equals(_preparedSystemPrompt, desiredSystemPrompt, StringComparison.Ordinal);
+                if (!EnsurePrepared(context, modelPath, desiredSystemPrompt))
+                {
+                    return false;
+                }
+
+                // Every visible chat begins with a clean native session. The caller still
+                // supplies that chat's recent turns with each request, so reopening a panel
+                // keeps relevant context without leaking dialogue from another screen.
+                return !canResetExistingConversation || ProcessSystemPrompt(desiredSystemPrompt);
+            }).ConfigureAwait(false);
         }
         finally
         {
@@ -380,31 +445,44 @@ internal sealed class LocalQwenRuntime
         Context context,
         string modelPath,
         string question,
-        TourGuideStop stop = TourGuideStop.GreatGate)
+        TourGuideStop stop = TourGuideStop.GreatGate,
+        string? systemPrompt = null)
     {
+        var desiredSystemPrompt = systemPrompt ?? AppTourKnowledge.BuildHolisticSystemPrompt();
         // A real send supersedes background preparations queued by older chat panels.
         Interlocked.Increment(ref _preparationVersion);
-        await _operationGate.WaitAsync().ConfigureAwait(false);
+        if (!await _operationGate.WaitAsync(CompletionGateWait).ConfigureAwait(false))
+        {
+            Android.Util.Log.Info(
+                LogTag,
+                "The model is busy preparing; returning the immediate offline fallback instead of queuing the send.");
+            return null;
+        }
+
         try
         {
             return await Task.Run(() =>
             {
-                if (!EnsurePrepared(context, modelPath, stop))
+                if (!EnsurePrepared(context, modelPath, desiredSystemPrompt))
                 {
+                    Android.Util.Log.Warn(LogTag, "Completion stopped because the runtime was not prepared.");
                     return null;
                 }
 
-                if (InvokeInt(
+                var promptResult = InvokeInt(
                         "processUserPrompt",
                         new Java.Lang.String(question),
 #pragma warning disable CA1422
-                        new Java.Lang.Integer(PredictionTokenLimit)) != 0)
+                        new Java.Lang.Integer(PredictionTokenLimit));
 #pragma warning restore CA1422
+                if (promptResult != 0)
                 {
+                    Android.Util.Log.Warn(LogTag, $"User prompt processing failed with code {promptResult}.");
                     return null;
                 }
 
                 var reply = new StringBuilder();
+                var generatedTokenCalls = 0;
                 while (true)
                 {
                     var token = Invoke("generateNextToken") as Java.Lang.String;
@@ -413,14 +491,19 @@ internal sealed class LocalQwenRuntime
                         break;
                     }
 
+                    generatedTokenCalls++;
                     reply.Append(token.ToString());
                 }
 
+                Android.Util.Log.Info(
+                    LogTag,
+                    $"Generation completed with {generatedTokenCalls} token callbacks and {reply.Length} characters.");
                 return reply.ToString().Trim();
             }).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            Android.Util.Log.Warn(LogTag, $"Completion failed with {exception.GetType().Name}.");
             TryUnloadModel();
             return null;
         }
@@ -430,21 +513,28 @@ internal sealed class LocalQwenRuntime
         }
     }
 
-    private bool EnsurePrepared(Context context, string modelPath, TourGuideStop stop)
+    private bool EnsurePrepared(Context context, string modelPath, string desiredSystemPrompt)
     {
         try
         {
             if (!IsSupported)
             {
+                Android.Util.Log.Warn(LogTag, "The device ABI does not support the local model runtime.");
                 return false;
             }
 
-            _bridge ??= Java.Lang.Class.ForName("com.companyname.AndroidApp1.LocalQwenBridge");
+            // The bridge is packaged in the app's classes.dex. Class.ForName from the
+            // managed runtime can resolve through the boot/Mono loader on some devices,
+            // where app-defined Java classes are invisible, so always prefer the APK's
+            // own class loader.
+            _bridge ??= context.ClassLoader?.LoadClass("com.companyname.AndroidApp1.LocalQwenBridge")
+                ?? Java.Lang.Class.ForName("com.companyname.AndroidApp1.LocalQwenBridge");
             if (!_backendInitialized)
             {
                 var nativeLibraryDirectory = context.ApplicationInfo?.NativeLibraryDir;
                 if (string.IsNullOrWhiteSpace(nativeLibraryDirectory))
                 {
+                    Android.Util.Log.Warn(LogTag, "The app native-library directory is unavailable.");
                     return false;
                 }
 
@@ -459,14 +549,18 @@ internal sealed class LocalQwenRuntime
                     TryUnloadModel();
                 }
 
-                if (InvokeInt("load", new Java.Lang.String(modelPath)) != 0)
+                var loadResult = InvokeInt("load", new Java.Lang.String(modelPath));
+                if (loadResult != 0)
                 {
+                    Android.Util.Log.Warn(LogTag, $"Model loading failed with code {loadResult}.");
                     return false;
                 }
 
                 _nativeModelLoaded = true;
-                if (InvokeInt("prepare") != 0)
+                var prepareResult = InvokeInt("prepare");
+                if (prepareResult != 0)
                 {
+                    Android.Util.Log.Warn(LogTag, $"Model preparation failed with code {prepareResult}.");
                     TryUnloadModel();
                     return false;
                 }
@@ -475,24 +569,42 @@ internal sealed class LocalQwenRuntime
                 _loadedModelPath = modelPath;
             }
 
-            if (!_holisticPromptPrepared)
+            if (!_systemPromptPrepared ||
+                !string.Equals(_preparedSystemPrompt, desiredSystemPrompt, StringComparison.Ordinal))
             {
-                var systemPrompt = AppTourKnowledge.BuildHolisticSystemPrompt();
-                if (InvokeInt("processSystemPrompt", new Java.Lang.String(systemPrompt)) != 0)
+                if (!ProcessSystemPrompt(desiredSystemPrompt))
                 {
                     return false;
                 }
-
-                _holisticPromptPrepared = true;
             }
 
             return true;
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            Android.Util.Log.Warn(LogTag, $"Runtime preparation failed with {exception.GetType().Name}.");
             TryUnloadModel();
             return false;
         }
+    }
+
+    private bool ProcessSystemPrompt(string systemPrompt)
+    {
+        var promptResult = InvokeInt("processSystemPrompt", new Java.Lang.String(systemPrompt));
+        if (promptResult != 0)
+        {
+            Android.Util.Log.Warn(
+                LogTag,
+                $"System prompt processing failed with code {promptResult}; source length was {systemPrompt.Length} characters.");
+            _systemPromptPrepared = false;
+            _preparedSystemPrompt = null;
+            return false;
+        }
+
+        Android.Util.Log.Info(LogTag, $"System prompt prepared from {systemPrompt.Length} characters.");
+        _systemPromptPrepared = true;
+        _preparedSystemPrompt = systemPrompt;
+        return true;
     }
 
     private void TryUnloadModel()
@@ -517,7 +629,8 @@ internal sealed class LocalQwenRuntime
         _nativeModelLoaded = false;
         _modelPrepared = false;
         _loadedModelPath = null;
-        _holisticPromptPrepared = false;
+        _systemPromptPrepared = false;
+        _preparedSystemPrompt = null;
     }
 
     private void InvokeVoid(string methodName, params Java.Lang.Object[] arguments)
