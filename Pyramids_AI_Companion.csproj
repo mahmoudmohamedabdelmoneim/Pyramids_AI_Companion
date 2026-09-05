@@ -17,7 +17,7 @@
     <!-- Embedded Debug assemblies are packaged as native-library payloads on Android.
          Keep the internal assembly filename free of spaces so PackageManager extracts
          the entry assembly and the runtime can register the generated JNI callbacks. -->
-    <AssemblyName>AndroidApp1.Modernized</AssemblyName>
+    <AssemblyName>Pyramids_AI_Companion</AssemblyName>
     <ApplicationVersion>1</ApplicationVersion>
     <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
     <!--

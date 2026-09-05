@@ -365,5 +365,9 @@ FodyWeavers.xsd
 # Native and model build workspaces
 /build/
 
+# Local presentation generation workspace and generated deliverables
+/.codex-build/
+/deliverables/
+
 # Git metadata checkout used to connect this project root to its remote
 /Android_Modernized/

@@ -1,11 +1,11 @@
 <resources>
-    <string name="app_name">AI Tourist Guide</string>
+    <string name="app_name">Pyramids AI Companion</string>
     <string name="photo_one_description">First Giza photo</string>
     <string name="photo_two_description">Second Giza photo</string>
     <string name="next">NEXT  →</string>
     <string name="next_description">Continue to the next experience</string>
     <string name="offline_ai_download_message">We\'re downloading AI model capabilities. You can continue on the app while we finish this.</string>
-    <string name="account_screen_title">Welcome to AI Tourist Guide</string>
+    <string name="account_screen_title">Welcome to Pyramids AI Companion</string>
     <string name="create_account">Create Account</string>
     <string name="sign_in">Already have an account? Sign in</string>
     <string name="employee_login">Login as Employee</string>
@@ -15,7 +15,7 @@
     <string name="enlarge_video">ENLARGE VIDEO</string>
     <string name="make_video_small">MAKE VIDEO SMALL</string>
     <string name="video_unavailable">Add pyramids_video.mp4 to Resources/raw to play the Pyramids video.</string>
-    <string name="guest_experience">Feel the authentic experience of the ancient wonders and elevate your experience with AI Tourist Guide for Giza Plateau</string>
+    <string name="guest_experience">Feel the authentic experience of the ancient wonders and elevate your experience with Pyramids AI Companion for Giza Plateau</string>
     <string name="guest_trip_management">Manage your ancient city trip.</string>
     <string name="guest_control">You\'re in Control</string>
     <string name="guest_sign_up_begin">Sign Up To Begin Your Experience</string>
@@ -47,7 +47,7 @@
     <string name="user_welcome_title">Welcome to Giza</string>
     <string name="user_welcome_intro">Your ancient journey is ready to begin.</string>
     <string name="location_question">Would you like to share your location?</string>
-    <string name="location_explanation">Location helps AI Tourist Guide tailor directions around the Giza Plateau.</string>
+    <string name="location_explanation">Location helps Pyramids AI Companion tailor directions around the Giza Plateau.</string>
     <string name="share_location">SHARE LOCATION</string>
     <string name="continue_without_location">CONTINUE WITHOUT LOCATION</string>
     <string name="choose_pass">Choose the pass you want to book</string>
